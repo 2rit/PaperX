@@ -1,0 +1,23 @@
+{
+  "name": "PAPERX – Smart Document Scanner",
+  "short_name": "PAPERX",
+  "description": "สแกน ปรับให้ตรง คมชัด OCR ไทย-อังกฤษ ส่งออก PDF ประมวลผลในเครื่อง",
+  "lang": "th",
+  "start_url": "/PaperX/#/home",
+  "scope": "/PaperX/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f4f5f2",
+  "theme_color": "#1c1f22",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    { "src": "/PaperX/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/PaperX/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/PaperX/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/PaperX/icons/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ],
+  "shortcuts": [
+    { "name": "สแกนเอกสาร", "url": "/PaperX/#/camera", "icons": [{ "src": "/PaperX/icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "คลังเอกสาร", "url": "/PaperX/#/library", "icons": [{ "src": "/PaperX/icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}

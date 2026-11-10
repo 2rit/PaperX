@@ -1,0 +1,26 @@
+import { chromium } from 'playwright';
+const URL = process.env.URL || 'http://localhost:4173/';
+const b = await chromium.launch({ args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'] });
+const ctx = await b.newContext({ viewport: { width: 1280, height: 860 } });
+const p = await ctx.newPage();
+const errs = [];
+p.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') errs.push(m.type() + ': ' + m.text()); });
+p.on('pageerror', (e) => errs.push('pageerror: ' + e.message));
+await p.goto(URL);
+await p.waitForSelector('[data-testid=hero]');
+await p.screenshot({ path: 'screenshots/_smoke_home.png' });
+const [fc] = await Promise.all([p.waitForEvent('filechooser'), p.click('[data-testid=home-import]')]);
+const t0 = Date.now();
+await fc.setFiles(process.env.IMG || 'test-assets/skewed_shadow.jpg');
+await p.waitForSelector('[data-testid=editor] [data-testid=ed-canvas]', { timeout: 60000 });
+console.log('import→editor ms', Date.now() - t0);
+await p.waitForTimeout(1500);
+await p.screenshot({ path: 'screenshots/_smoke_editor.png' });
+const doc = await p.evaluate(async () => {
+  const r = indexedDB.open('paperx'); await new Promise((res) => (r.onsuccess = res));
+  const t = r.result.transaction('docs').objectStore('docs').getAll(); await new Promise((res) => (t.onsuccess = res));
+  return t.result.map((d) => ({ name: d.name, pages: d.pages.map((p) => ({ corners: p.corners, mids: p.mids, mode: p.mode, outW: p.outW, outH: p.outH })) }));
+});
+console.log(JSON.stringify(doc, null, 1));
+console.log('ERRORS', errs);
+await b.close();
