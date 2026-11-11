@@ -15,8 +15,8 @@ import { cx, Sheet, Button, Spinner, Thumb } from '../components/ui';
 type TrayItem = { id: string; status: 'processing' | 'ready' | 'error'; page?: Page; pages?: Page[]; preview: string; book?: boolean };
 type CamState = 'starting' | 'live' | 'denied' | 'unavailable';
 
-const STABLE_MS = 1100;
-const MOVE_TOL = 0.018;
+const STABLE_MS = 800;
+const MOVE_TOL = 0.012;
 
 export default function CameraScreen({ docId }: { docId?: string }) {
   const s = useSettings();
@@ -37,6 +37,7 @@ export default function CameraScreen({ docId }: { docId?: string }) {
   trayRef.current = tray;
   const procQueue = useRef<Promise<void>>(Promise.resolve());
   const lastQuad = useRef<Quad | null>(null);
+  const lastMids = useRef<Quad | null>(null);
   const stableSince = useRef(0);
   const armed = useRef(true);
   const capturing = useRef(false);
@@ -161,7 +162,7 @@ export default function CameraScreen({ docId }: { docId?: string }) {
     const ok = d.found && d.corners && (d.areaRatio ?? 0) > 0.15;
     if (!ok) {
       if (!lostSince.current) lostSince.current = now;
-      if (now - lostSince.current > 400) { setDet(null); lastQuad.current = null; armed.current = true; }
+      if (now - lostSince.current > 400) { setDet(null); lastQuad.current = null; lastMids.current = null; armed.current = true; }
       stableSince.current = 0;
       setStableP(0);
       return;
@@ -170,10 +171,16 @@ export default function CameraScreen({ docId }: { docId?: string }) {
     const q = d.corners!;
     const prev = lastQuad.current;
     const move = prev ? Math.max(...q.map((p, i) => Math.hypot(p.x - prev[i].x, p.y - prev[i].y))) : 1;
-    // smooth overlay to avoid jitter
-    const sm = prev && move < 0.06 ? (q.map((p, i) => ({ x: prev[i].x * 0.5 + p.x * 0.5, y: prev[i].y * 0.5 + p.y * 0.5 })) as Quad) : q;
+    // One-euro-style: nearly still frames are heavily smoothed so the overlay does not jitter;
+    // a real movement snaps instead of lagging behind the page.
+    const alpha = !prev || move > 0.05 ? 1 : move > 0.02 ? 0.62 : 0.28;
+    const mix = (a: { x: number; y: number }, b: { x: number; y: number }) => ({ x: a.x * (1 - alpha) + b.x * alpha, y: a.y * (1 - alpha) + b.y * alpha });
+    const sm = (prev && alpha < 1 ? q.map((p, i) => mix(prev[i], p)) : q) as Quad;
+    const pm = lastMids.current;
+    const mids = d.mids ? (pm && alpha < 1 ? d.mids.map((p, i) => mix(pm[i], p)) as Quad : d.mids) : null;
     lastQuad.current = sm;
-    setDet({ ...d, corners: sm });
+    lastMids.current = mids;
+    setDet({ ...d, corners: sm, mids: mids ?? undefined });
     if (!armed.current) {
       if (move > 0.08) armed.current = true; // page changed / moved → allow next auto capture
       stableSince.current = 0;
@@ -316,6 +323,7 @@ export default function CameraScreen({ docId }: { docId?: string }) {
   const found = !!det?.found;
   const stable = found && stableP > 0.35;
   const q = det?.corners?.map(map);
+  const qm = det?.mids?.map(map);
   const readyCount = tray.filter((t) => t.status === 'ready').length;
   const pageCount = tray.reduce((n, t) => n + (t.book ? 2 : 1), 0);
 
@@ -347,7 +355,7 @@ export default function CameraScreen({ docId }: { docId?: string }) {
             {!found && <FrameGuides w={dims.cw} h={dims.ch} />}
             {q && (
               <g className="transition-all">
-                <polygon points={q.map((p) => `${p.x},${p.y}`).join(' ')} fill="rgba(142,224,74,0.14)" stroke="#8ee04a" strokeWidth="2.5" strokeLinejoin="round" data-testid="cam-quad" />
+                <path d={overlayPath(q, qm)} fill="rgba(142,224,74,0.14)" stroke="#8ee04a" strokeWidth="2.5" strokeLinejoin="round" data-testid="cam-quad" />
                 {s.captureMode === 'book' && <line data-testid="cam-spine" x1={(q[0].x + q[1].x) / 2} y1={(q[0].y + q[1].y) / 2} x2={(q[3].x + q[2].x) / 2} y2={(q[3].y + q[2].y) / 2} stroke="#8ee04a" strokeWidth="2" strokeDasharray="8 7" />}
                 {q.map((p, i) => {
                   const a = q[(i + 1) % 4], b = q[(i + 3) % 4];
@@ -462,6 +470,16 @@ export default function CameraScreen({ docId }: { docId?: string }) {
       </Sheet>
     </div>
   );
+}
+
+function overlayPath(q: { x: number; y: number }[], mids?: { x: number; y: number }[] | null) {
+  if (!mids) return `M${q.map((p) => `${p.x},${p.y}`).join('L')}Z`;
+  let d = `M${q[0].x},${q[0].y}`;
+  for (let i = 0; i < 4; i++) {
+    const a = q[(i + 1) % 4], m = mids[i];
+    d += ` Q${m.x},${m.y} ${a.x},${a.y}`;
+  }
+  return d + 'Z';
 }
 
 function norm(x: number, y: number) {

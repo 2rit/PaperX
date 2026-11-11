@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 import { enhance, warp, quadSize, detectSkew, type Img } from '../lib/imaging';
-import { estimateFlow, applyFlow, findSpine, cropHalf, type FlowField } from '../lib/flatten';
+import { estimateFlow, applyFlow, findSpine, cropHalf, removeFingers, type FlowField } from '../lib/flatten';
 import type { PageParams, Pt } from '../lib/types';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -101,6 +101,7 @@ async function geometry(key: string, p: PageParams, target: Target): Promise<Img
   let img = await warped(key, p, target);
   if (p.book) img = cropHalf(img, p.book.side, p.book.at);
   if (p.flatten) {
+    img = removeFingers(img);
     // the field is estimated on a ~720px copy, so it is resolution independent: cache it per geometry
     const fk = `${key}|${JSON.stringify(p.corners)}|${JSON.stringify(p.mids)}|${JSON.stringify(p.book || null)}`;
     let f = flowCache.get(fk);

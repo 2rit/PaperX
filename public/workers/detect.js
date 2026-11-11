@@ -65,6 +65,37 @@ function minAngleOk(q) {
   return true;
 }
 
+/** Border-connected skin (a hand holding the sheet). Interior skin — a photo on the page — is kept. */
+function handMask(src) {
+  const w = src.cols, h = src.rows, data = src.data;
+  const skin = new Uint8Array(w * h);
+  for (let p = 0, i = 0; p < skin.length; p++, i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const cb = 128 - (0.168736 * r + 0.331264 * g - 0.5 * b);
+    const cr = 128 + (0.5 * r - 0.418688 * g - 0.081312 * b);
+    if (r > 95 && r > g + 8 && cr > 138 && cr < 185 && cb > 78 && cb < 132) skin[p] = 1;
+  }
+  const seen = new Uint8Array(w * h);
+  const stack = [];
+  const push = (p) => { if (p >= 0 && p < skin.length && skin[p] && !seen[p]) { seen[p] = 1; stack.push(p); } };
+  for (let x = 0; x < w; x++) { push(x); push((h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+  while (stack.length) {
+    const p = stack.pop();
+    const x = p % w;
+    if (x > 0) push(p - 1);
+    if (x + 1 < w) push(p + 1);
+    push(p - w);
+    push(p + w);
+  }
+  const mask = cv.Mat.zeros(h, w, cv.CV_8UC1);
+  const md = mask.data;
+  let n = 0;
+  for (let p = 0; p < seen.length; p++) if (seen[p]) { md[p] = 255; n++; }
+  mask._count = n;
+  return mask;
+}
+
 function contourPts(cnt) {
   const d = cnt.data32S, out = [];
   for (let i = 0; i < d.length; i += 2) out.push({ x: d[i], y: d[i + 1] });
@@ -87,7 +118,7 @@ function edgeMids(q, pts) {
     }
     let off = 0;
     if (offs.length) { offs.sort((a, b) => a - b); off = offs[offs.length >> 1]; }
-    if (Math.abs(off) < L * 0.022) off = 0;
+    if (Math.abs(off) < L * 0.04) off = 0;
     mids.push({ x: (A.x + B.x) / 2 + nx * off, y: (A.y + B.y) / 2 + ny * off, curved: off !== 0 });
   }
   return mids;
@@ -114,10 +145,20 @@ function detect(imgData) {
   const candidates = [];
   const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
   const kernelBig = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(9, 9));
+  const kernelText = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(15, 15));
+  const hand = handMask(src);
+  const noHand = new cv.Mat();
+  cv.bitwise_not(hand, noHand);
 
-  const consider = (bin, tag) => {
+  const consider = (bin, tag, stripHand = false) => {
+    const use = new cv.Mat();
+    if (stripHand && hand._count > 30) {
+      cv.bitwise_and(bin, noHand, use);
+      cv.morphologyEx(use, use, cv.MORPH_CLOSE, kernelBig);
+    } else bin.copyTo(use);
     const contours = new cv.MatVector(), hier = new cv.Mat();
-    cv.findContours(bin, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+    cv.findContours(use, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+    use.delete();
     for (let i = 0; i < contours.size(); i++) {
       const cnt = contours.get(i);
       const a = cv.contourArea(cnt);
@@ -136,10 +177,19 @@ function detect(imgData) {
       if (quad) {
         const q = orderCorners(quad);
         const qa = polyArea(q);
-        if (isConvex(q) && minAngleOk(q) && qa < area * 0.985) {
+        const topE = Math.hypot(q[1].x - q[0].x, q[1].y - q[0].y), botE = Math.hypot(q[2].x - q[3].x, q[2].y - q[3].y);
+        const leftE = Math.hypot(q[3].x - q[0].x, q[3].y - q[0].y), rightE = Math.hypot(q[2].x - q[1].x, q[2].y - q[1].y);
+        const aspect = Math.max(topE + botE, leftE + rightE) / Math.min(topE + botE, leftE + rightE);
+        if (isConvex(q) && minAngleOk(q) && qa < area * 0.985 && aspect < 2.5) {
           // fill ratio: how well the contour fills the quad (rejects random shapes)
           const fill = a / qa;
-          if (fill > 0.82) candidates.push({ q, score: qa * (0.6 + 0.4 * fill), tag, pts: contourPts(cnt) });
+          if (fill > 0.82) {
+            // Canny follows the real boundary. Bright/normalized masks are the fallback
+            // for low-contrast paper and should not outrank a tight edge contour.
+            let score = qa * (0.6 + 0.4 * fill);
+            if (String(tag).startsWith('canny')) score *= 1.22;
+            candidates.push({ q, score, tag, pts: contourPts(cnt) });
+          }
         }
       }
       hull.delete(); cnt.delete();
@@ -163,14 +213,37 @@ function detect(imgData) {
   cv.threshold(pb, th, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
   cv.morphologyEx(th, th, cv.MORPH_CLOSE, kernelBig);
   cv.morphologyEx(th, th, cv.MORPH_OPEN, kernelBig);
-  consider(th, 'otsu');
+  consider(th, 'otsu', true);
   // 3) Otsu on gray
   const th2 = new cv.Mat();
   cv.threshold(blur, th2, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
   cv.morphologyEx(th2, th2, cv.MORPH_CLOSE, kernelBig);
-  consider(th2, 'otsuGray');
+  consider(th2, 'otsuGray', true);
+  // Bright-paper masks. A white sheet on a white table has almost no Canny edge, but it is
+  // still a few levels brighter than the table. Several cutoffs, text holes closed.
+  const hi = new cv.Mat();
+  for (const cut of [205, 225, 240, 248]) {
+    cv.threshold(blur, hi, cut, 255, cv.THRESH_BINARY);
+    cv.morphologyEx(hi, hi, cv.MORPH_CLOSE, kernelText);
+    cv.morphologyEx(hi, hi, cv.MORPH_OPEN, kernel);
+    consider(hi, 'bright' + cut, true);
+  }
+  // Illumination-normalized edges only when the fast masks missed the page (white on white,
+  // heavy shadow). Skipping it on an easy frame keeps the live preview responsive.
+  const havePage = candidates.some((c) => c.score > area * 0.22);
+  const wide = new cv.Mat();
+  const illum = new cv.Mat();
+  const nedges = new cv.Mat();
+  if (!havePage) {
+    cv.GaussianBlur(gray, wide, new cv.Size(0, 0), 21);
+    cv.divide(gray, wide, illum, 180);
+    cv.GaussianBlur(illum, blur, k5, 0);
+    cv.Canny(blur, nedges, 20, 60);
+    cv.dilate(nedges, nedges, kernel, new cv.Point(-1, -1), 2);
+    consider(nedges, 'norm');
+  }
 
-  [src, gray, hsv, rgb, sat, val, paperness, blur, edges, pb, th, th2, kernel, kernelBig].forEach((m) => m.delete());
+  [src, gray, hsv, rgb, sat, val, paperness, blur, edges, pb, th, th2, kernel, kernelBig, kernelText, hand, noHand, hi, wide, illum, nedges].forEach((m) => m.delete());
   chans.delete();
 
   if (!candidates.length) return { found: false };
