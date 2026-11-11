@@ -180,7 +180,10 @@ function detect(imgData) {
         const topE = Math.hypot(q[1].x - q[0].x, q[1].y - q[0].y), botE = Math.hypot(q[2].x - q[3].x, q[2].y - q[3].y);
         const leftE = Math.hypot(q[3].x - q[0].x, q[3].y - q[0].y), rightE = Math.hypot(q[2].x - q[1].x, q[2].y - q[1].y);
         const aspect = Math.max(topE + botE, leftE + rightE) / Math.min(topE + botE, leftE + rightE);
-        if (isConvex(q) && minAngleOk(q) && qa < area * 0.985 && aspect < 2.5) {
+        // Long thermal slips are skinny but still a real page. A bright interior
+        // stripe (aspect ~6, small area) is not, and stays rejected.
+        const longSlip = aspect >= 2.5 && aspect <= 6.2 && qa > area * 0.3;
+        if (isConvex(q) && minAngleOk(q) && qa < area * 0.985 && (aspect < 2.5 || longSlip)) {
           // fill ratio: how well the contour fills the quad (rejects random shapes)
           const fill = a / qa;
           if (fill > 0.82) {
@@ -219,6 +222,17 @@ function detect(imgData) {
   cv.threshold(blur, th2, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
   cv.morphologyEx(th2, th2, cv.MORPH_CLOSE, kernelBig);
   consider(th2, 'otsuGray', true);
+  // Chalk on a blackboard is the inverse of a white page: edges show up after a flip.
+  if (cv.mean(gray)[0] < 105) {
+    const inv = new cv.Mat();
+    const de = new cv.Mat();
+    cv.bitwise_not(blur, inv);
+    cv.Canny(inv, de, 25, 80);
+    cv.dilate(de, de, kernel, new cv.Point(-1, -1), 2);
+    consider(de, 'dark');
+    inv.delete();
+    de.delete();
+  }
   // Bright-paper masks. A white sheet on a white table has almost no Canny edge, but it is
   // still a few levels brighter than the table. Several cutoffs, text holes closed.
   const hi = new cv.Mat();

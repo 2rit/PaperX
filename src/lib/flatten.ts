@@ -49,7 +49,34 @@ function grayOf(img: Img, maxW: number) {
  * Narrow dark strokes only. A wide horizontal blur is the local paper brightness, so a gutter
  * shadow or a finger (both wide) cancels out and text strokes remain.
  */
+/** Lift a dark gutter / uneven shade so text strokes survive on both pages of a spread. */
+function liftShade(g: Float32Array, w: number, h: number) {
+  const rad = Math.max(10, Math.round(Math.min(w, h) / 16));
+  const bg = new Float32Array(g);
+  // separable box blur, two passes
+  const tmp = new Float32Array(g.length);
+  const blur1 = (src: Float32Array, dst: Float32Array, horiz: boolean) => {
+    const len = horiz ? w : h, lines = horiz ? h : w, step = horiz ? 1 : w, lstep = horiz ? w : 1;
+    const inv = 1 / (2 * rad + 1);
+    for (let l = 0; l < lines; l++) {
+      const base = l * lstep;
+      let acc = 0;
+      for (let k = -rad; k <= rad; k++) acc += src[base + Math.min(len - 1, Math.max(0, k)) * step];
+      for (let i = 0; i < len; i++) {
+        dst[base + i * step] = acc * inv;
+        acc += src[base + Math.min(len - 1, i + rad + 1) * step] - src[base + Math.max(0, i - rad) * step];
+      }
+    }
+  };
+  blur1(bg, tmp, true); blur1(tmp, bg, false);
+  blur1(bg, tmp, true); blur1(tmp, bg, false);
+  const out = new Float32Array(g.length);
+  for (let i = 0; i < g.length; i++) out[i] = Math.min(255, (g[i] / Math.max(40, bg[i])) * 210);
+  return out;
+}
+
 function textInk(g: Float32Array, w: number, h: number) {
+  g = liftShade(g, w, h);
   const r = Math.max(6, Math.round(w / 14));
   const ink = new Float32Array(w * h);
   const pref = new Float64Array(w + 1);
@@ -366,10 +393,12 @@ function estimateFromLines(img: Img): FlowField | null {
     const col = bandShift.map((s) => s[i]).sort((a, b) => a - b);
     median[i] = col[col.length >> 1];
   }
-  const xs: number[] = [], ys: number[] = [];
-  for (let i = 0; i < STRIPS; i++) { xs.push((i + 0.5) / STRIPS); ys.push(median[i]); }
-  const quad = fitQuadratic(xs, ys);
-  const sheet = quad ? xs.map((x) => quad(x)) : median;
+  // Keep the measured profile (lightly smoothed). A single quadratic cannot
+  // follow the steep bend right next to a book gutter.
+  const sheet = median.map((v, i) => {
+    const l = median[Math.max(0, i - 1)], r = median[Math.min(STRIPS - 1, i + 1)];
+    return v * 0.5 + (l + r) * 0.25;
+  });
   let maxAbsPx = 0;
   for (const v of sheet) maxAbsPx = Math.max(maxAbsPx, Math.abs(v));
   if (maxAbsPx < h * 0.004) return null;
@@ -422,8 +451,58 @@ function addField(total: FlowField, extra: FlowField) {
   }
 }
 
+/**
+ * Solid table rules and dotted/dashed leader lines. These must stay straight, so the
+ * displacement along each one is replaced by a smooth quadratic instead of a wiggly field.
+ */
+function ruleRows(ink: Float32Array, w: number, h: number) {
+  const ys: number[] = [];
+  for (let y = 1; y < h - 1; y++) {
+    let dark = 0, runs = 0, runLen = 0, short = 0, prev = false;
+    for (let x = 0; x < w; x++) {
+      const on = ink[y * w + x] > 1.2 || ink[(y - 1) * w + x] > 1.2 || ink[(y + 1) * w + x] > 1.2;
+      if (on) {
+        dark++;
+        if (!prev) { runs++; runLen = 1; } else runLen++;
+      } else if (prev) {
+        if (runLen <= 3) short++;
+        prev = false;
+      }
+      prev = on;
+    }
+    const cov = dark / w;
+    const solid = cov > 0.5;
+    const dotted = runs >= Math.max(8, w / 48) && short >= runs * 0.55 && cov > 0.025 && cov < 0.4;
+    if ((solid || dotted) && (!ys.length || y - ys[ys.length - 1] > 4)) ys.push(y);
+  }
+  return ys;
+}
+
+function enforceRules(img: Img, f: FlowField) {
+  const { g, w, h } = grayOf(img, 640);
+  const ink = textInk(g, w, h);
+  const rules = ruleRows(ink, w, h);
+  if (rules.length < 2) return;
+  for (const y of rules) {
+    const j = Math.max(0, Math.min(f.gy - 1, Math.round((y / h) * (f.gy - 1))));
+    const xs: number[] = [], ys: number[] = [];
+    for (let i = 0; i < f.gx; i++) { xs.push((i + 0.5) / f.gx); ys.push(f.d[i * f.gy + j]); }
+    const q = fitQuadratic(xs, ys);
+    if (!q) continue;
+    for (let i = 0; i < f.gx; i++) {
+      const v = Math.max(-0.14, Math.min(0.14, q((i + 0.5) / f.gx)));
+      for (let dj = -1; dj <= 1; dj++) {
+        const jj = j + dj;
+        if (jj < 0 || jj >= f.gy) continue;
+        const idx = i * f.gy + jj;
+        f.d[idx] = f.d[idx] * 0.2 + v * 0.8;
+      }
+    }
+  }
+}
+
 /** Mean absolute disagreement of strip shifts versus the centre strip, in pixels. */
-function lineSpread(img: Img) {
+export function lineSpread(img: Img) {
   const { g, w, h } = grayOf(img, 420);
   const ink = textInk(g, w, h);
   const n = 8;
@@ -473,6 +552,7 @@ export function estimateFlow(img: Img, iters = 2): FlowField | null {
     if (it < iters - 1) small = applyFlow(shrink(img, 720), total);
   }
   if (!total) return null;
+  enforceRules(small, total);
   let m = 0;
   for (const v of total.d) m = Math.max(m, Math.abs(v));
   if (total.dx) for (const v of total.dx) m = Math.max(m, Math.abs(v));

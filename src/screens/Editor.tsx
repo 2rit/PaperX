@@ -356,7 +356,8 @@ export default function Editor({ id, startPage = 0 }: { id: string; startPage?: 
       if (mod && key === 'y') { e.preventDefault(); redo(); return; }
       if (mod && key === 's') { e.preventDefault(); save(); return; }
       if (mod || view === 'crop' || sheet) return;
-      if (e.key >= '1' && e.key <= '7') setMode(MODES[Number(e.key) - 1].id);
+      const modeKey = Number(e.key);
+      if (modeKey >= 1 && modeKey <= MODES.length) setMode(MODES[modeKey - 1].id);
       else if (key === 'r') rotate();
       else if (key === 'c') setView('crop');
       else if (key === 'b') setView((v) => (v === 'compare' ? 'edit' : 'compare'));

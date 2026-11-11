@@ -320,6 +320,54 @@ function saturate(img: Img, s: number) {
   }
 }
 
+function chalkBoard(L: Uint8ClampedArray) {
+  let mean = 0, light = 0;
+  for (let i = 0; i < L.length; i++) mean += L[i];
+  mean /= L.length;
+  if (mean > 100) return false;
+  for (let i = 0; i < L.length; i++) if (L[i] > mean + 45) light++;
+  const f = light / L.length;
+  return f > 0.008 && f < 0.4;
+}
+
+function glareFraction(img: Img) {
+  const d = img.data;
+  const step = Math.max(1, Math.floor(d.length / 4 / 8000));
+  let n = 0, g = 0;
+  for (let i = 0; i < d.length; i += step * 4) {
+    n++;
+    const l = (d[i] * 30 + d[i + 1] * 59 + d[i + 2] * 11) / 100;
+    if (l > 248) g++;
+  }
+  return g / Math.max(1, n);
+}
+
+/** Put red and blue stamp ink back after a clean-up pass. Ordinary paper is left alone. */
+function restoreStamps(img: Img, orig: Uint8ClampedArray) {
+  const d = img.data;
+  for (let j = 0; j < d.length; j += 4) {
+    const r = orig[j], g = orig[j + 1], b = orig[j + 2];
+    const red = r > 170 && g < 120 && b < 120 && r > g + 70 && r > b + 70;
+    const blue = b > 140 && r < 110 && g < 150 && b > r + 50;
+    if (red || blue) { d[j] = r; d[j + 1] = g; d[j + 2] = b; }
+  }
+}
+
+/** Pull specular blobs down toward the local paper brightness. */
+function suppressGlare(img: Img) {
+  const { width: w, height: h, data: d } = img;
+  const L = luminance(img);
+  const bg = background(L, w, h, 36);
+  for (let i = 0, j = 0; i < L.length; i++, j += 4) {
+    if (L[i] < 236 || L[i] < bg[i] + 18) continue;
+    const k = Math.min(0.85, (L[i] - bg[i]) / 80);
+    const t = Math.min(255, bg[i]);
+    d[j] = d[j] * (1 - k) + t * k;
+    d[j + 1] = d[j + 1] * (1 - k) + t * k;
+    d[j + 2] = d[j + 2] * (1 - k) + t * k;
+  }
+}
+
 /** Main enhancement pipeline. Mutates img. */
 export function enhance(img: Img, p: Pick<PageParams, 'mode' | 'brightness' | 'contrast' | 'saturation' | 'shadow' | 'sharpen'>) {
   const { width: w, height: h } = img;
@@ -348,12 +396,23 @@ export function enhance(img: Img, p: Pick<PageParams, 'mode' | 'brightness' | 'c
       break;
     }
     case 'textBoost': {
+      const orig = new Uint8ClampedArray(img.data);
+      let L0 = luminance(img);
+      // Chalk on a dark board is inverted before the normal clean-up, so a blackboard
+      // scan becomes black text on white without a separate mode.
+      if (chalkBoard(L0)) for (let i = 0; i < L0.length; i++) {
+        const v = 255 - L0[i];
+        const j = i * 4;
+        img.data[j] = img.data[j + 1] = img.data[j + 2] = v;
+      }
+      if (glareFraction(img) > 0.03) suppressGlare(img);
       if (p.shadow) normalizeColor(img, 1);
       const L = luminance(img);
       const black = Math.max(0, percentile(L, 0.03) + 10);
       applyLumaLUT(img, levelsLUT(black, p.shadow ? 238 : percentile(L, 0.95), 1.6));
       saturate(img, 1.1);
       if (p.sharpen) sharpen(img, 1.1, sr);
+      restoreStamps(img, orig);
       break;
     }
     case 'cleanPaper': {
@@ -376,6 +435,11 @@ export function enhance(img: Img, p: Pick<PageParams, 'mode' | 'brightness' | 'c
     }
     case 'highContrast': {
       const L = luminance(img);
+      let mean = 0;
+      for (let i = 0; i < L.length; i++) mean += L[i];
+      mean /= L.length;
+      // White chalk on a blackboard: flip so the board becomes the paper.
+      if (mean < 105) for (let i = 0; i < L.length; i++) L[i] = 255 - L[i];
       if (p.shadow) normalizeGray(L, w, h);
       if (p.sharpen) {
         const tmp = { data: new Uint8ClampedArray(L.length * 4), width: w, height: h };
@@ -389,6 +453,7 @@ export function enhance(img: Img, p: Pick<PageParams, 'mode' | 'brightness' | 'c
       break;
     }
     case 'photo': {
+      if (glareFraction(img) > 0.03) suppressGlare(img);
       if (p.shadow) normalizeColor(img, 0.55);
       const L = luminance(img);
       applyLumaLUT(img, levelsLUT(percentile(L, 0.005), Math.max(200, percentile(L, 0.995)), 1));
