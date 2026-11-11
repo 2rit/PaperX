@@ -123,13 +123,13 @@ function mergeDetection(classical: Detection, learned: { corners: Quad; areaRati
   return classical;
 }
 
-export async function detectDocument(image: ImageData, opts?: { waitModel?: boolean }): Promise<Detection> {
+export async function detectDocument(image: ImageData, opts?: { waitModel?: boolean; hint?: Quad | null; fast?: boolean }): Promise<Detection> {
   const pixels = new Uint8ClampedArray(image.data);
   const view = { data: pixels, width: image.width, height: image.height };
   try {
-    const classicalP = detector.call<Detection>({ type: 'detect', image }, [image.data.buffer]);
-    // Live frames stay classical so the viewfinder is not blocked. A still asks the
-    // worker for DocAligner and does not wait long enough to freeze the page.
+    const classicalP = detector.call<Detection>({ type: 'detect', image, hint: opts?.hint || null, fast: !!opts?.fast }, [image.data.buffer]);
+    // A still waits briefly for DocAligner. The live viewfinder does not: it fires
+    // alignLive on its own cadence so the classical quad can return every frame.
     let learnedP: Promise<{ corners: Quad; areaRatio: number } | null> = Promise.resolve(null);
     if (opts?.waitModel) {
       const copy = new Uint8ClampedArray(pixels);
@@ -146,6 +146,31 @@ export async function detectDocument(image: ImageData, opts?: { waitModel?: bool
     console.warn('detect failed', e);
     return { found: false };
   }
+}
+
+/** DocAligner on a live frame. The caller must not await this on the camera loop. */
+export function alignLive(image: ImageData): Promise<{ corners: Quad; areaRatio: number } | null> {
+  const copy = new Uint8ClampedArray(image.data);
+  return proc.call<{ corners: Quad; areaRatio: number } | null>(
+    { type: 'align', width: image.width, height: image.height, data: copy },
+    [copy.buffer],
+  ).catch(() => null);
+}
+
+/** This frame's edge quad stays in charge. DocAligner fills in only when edges missed, or nudges a quad it agrees with. */
+export function fuseLive(classical: Detection, learned: { corners: Quad; areaRatio: number } | null, learnedAt: number): Detection {
+  if (!learned?.corners || performance.now() - learnedAt > 700) return classical;
+  if (!classical.found || !classical.corners) {
+    return { found: true, corners: learned.corners, areaRatio: learned.areaRatio, curved: false };
+  }
+  if (cornerGap(classical.corners, learned.corners) < 0.05) {
+    const corners = classical.corners.map((p, i) => ({
+      x: p.x * 0.82 + learned.corners[i].x * 0.18,
+      y: p.y * 0.82 + learned.corners[i].y * 0.18,
+    })) as Quad;
+    return { ...classical, corners };
+  }
+  return classical;
 }
 
 /** Human label for a detected sheet, from side ratio. */

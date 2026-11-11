@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { enhance, warp, quadSize, detectSkew, type Img } from '../lib/imaging';
+import { enhance, warp, quadSize, detectSkew, glareFraction, suppressGlare, type Img } from '../lib/imaging';
 import { estimateFlow, applyFlow, applyUvGrid, findSpine, cropHalf, removeFingers, lineSpread, type FlowField } from '../lib/flatten';
 import { dewarpGeneration, learnedCorners, learnedGrid, warmupModels } from '../lib/learned';
 import type { PageParams, Pt } from '../lib/types';
@@ -104,6 +104,8 @@ async function geometry(key: string, p: PageParams, target: Target): Promise<Img
   if (p.book) img = cropHalf(img, p.book.side, p.book.at);
   if (p.flatten) {
     img = removeFingers(img);
+    // Specular plastic hides the creases UVDoc needs. Soften glare before measuring them.
+    if (glareFraction(img) > 0.03) suppressGlare(img);
     // A nearly flat page does not need the learned grid. Loading it there also
     // pulls dark borders back in and undoes shadow removal.
     const curl = lineSpread(img);
@@ -119,7 +121,9 @@ async function geometry(key: string, p: PageParams, target: Target): Promise<Img
     if (hit) return cloneImg(hit);
     const geo = estimateFlow(img);
     let best = geo ? applyFlow(img, geo) : img;
-    if (gen === 1 && curl >= 2) {
+    // Preview stays on the fast geometric sheet so the editor never waits on the
+    // first model run. Saving and OCR use UVDoc when the page is actually curled.
+    if (gen === 1 && curl >= 2 && (target === 'full' || target === 'ocr')) {
       try {
         const grid = await learnedGrid(img);
         if (grid) {

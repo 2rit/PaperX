@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { BookOpen, Camera as CamIcon, Check, FileText, Image as ImageIcon, RefreshCw, X, Zap, ZapOff } from 'lucide-react';
-import { detectDocument, paperLabel, warmupDetector, detectorState, type Detection } from '../lib/engine';
+import { detectDocument, alignLive, fuseLive, paperLabel, warmupDetector, detectorState, type Detection } from '../lib/engine';
 import ModelProgress from '../components/ModelProgress';
 import { importFiles, pageFromBlob, renderPage, splitBook } from '../lib/pages';
 import { createDocFromPages, pickFiles } from '../lib/actions';
@@ -16,7 +16,7 @@ import { cx, Sheet, Button, Spinner, Thumb } from '../components/ui';
 type TrayItem = { id: string; status: 'processing' | 'ready' | 'error'; page?: Page; pages?: Page[]; preview: string; book?: boolean };
 type CamState = 'starting' | 'live' | 'denied' | 'unavailable';
 
-const STABLE_MS = 800;
+const STABLE_MS = 1000;
 const MOVE_TOL = 0.012;
 
 export default function CameraScreen({ docId }: { docId?: string }) {
@@ -30,6 +30,7 @@ export default function CameraScreen({ docId }: { docId?: string }) {
   const [det, setDet] = useState<Detection | null>(null);
   const [stableP, setStableP] = useState(0);
   const [flash, setFlash] = useState(0);
+  const [fly, setFly] = useState<{ id: number; src: string } | null>(null);
   const [tray, setTray] = useState<TrayItem[]>([]);
   const [confirmClose, setConfirmClose] = useState(false);
   const [cvReady, setCvReady] = useState(detectorState() === 'ready');
@@ -141,20 +142,31 @@ export default function CameraScreen({ docId }: { docId?: string }) {
     let alive = true;
     const small = document.createElement('canvas');
     const ctx = small.getContext('2d', { willReadFrequently: true })!;
+    let frameN = 0;
+    let alignBusy = false;
+    let learned: { corners: Quad; areaRatio: number } | null = null;
+    let learnedAt = 0;
     const loop = async () => {
       while (alive) {
         const v = videoRef.current;
-        if (!v || !v.videoWidth || document.hidden || capturing.current) { await new Promise((r) => setTimeout(r, 120)); continue; }
-        const k = 400 / Math.max(v.videoWidth, v.videoHeight);
+        if (!v || !v.videoWidth || document.hidden || capturing.current) { await new Promise((r) => setTimeout(r, 40)); continue; }
+        const k = 420 / Math.max(v.videoWidth, v.videoHeight);
         small.width = Math.round(v.videoWidth * k);
         small.height = Math.round(v.videoHeight * k);
         ctx.drawImage(v, 0, 0, small.width, small.height);
         const img = ctx.getImageData(0, 0, small.width, small.height);
-        const d = await detectDocument(img);
+        // DocAligner every third frame, off the camera loop. The edge quad returns immediately.
+        if (frameN % 3 === 0 && !alignBusy) {
+          alignBusy = true;
+          const snap = new ImageData(new Uint8ClampedArray(img.data), img.width, img.height);
+          alignLive(snap).then((r) => { if (r?.corners) { learned = r; learnedAt = performance.now(); } }).finally(() => { alignBusy = false; });
+        }
+        frameN++;
+        const d = await detectDocument(img, { hint: lastQuad.current, fast: true });
         if (!alive) break;
         setCvReady(detectorState() === 'ready');
-        onDetection(d);
-        await new Promise((r) => setTimeout(r, 60));
+        onDetection(fuseLive(d, learned, learnedAt));
+        await new Promise((r) => setTimeout(r, 0));
       }
     };
     loop();
@@ -166,8 +178,9 @@ export default function CameraScreen({ docId }: { docId?: string }) {
     const now = performance.now();
     const ok = d.found && d.corners && (d.areaRatio ?? 0) > 0.15;
     if (!ok) {
+      // One missed frame does not blink the fill. Anything longer and it is gone immediately.
       if (!lostSince.current) lostSince.current = now;
-      if (now - lostSince.current > 400) { setDet(null); lastQuad.current = null; lastMids.current = null; armed.current = true; }
+      if (now - lostSince.current > 70) { setDet(null); lastQuad.current = null; lastMids.current = null; armed.current = true; }
       stableSince.current = 0;
       setStableP(0);
       return;
@@ -178,7 +191,10 @@ export default function CameraScreen({ docId }: { docId?: string }) {
     const move = prev ? Math.max(...q.map((p, i) => Math.hypot(p.x - prev[i].x, p.y - prev[i].y))) : 1;
     // One-euro-style: nearly still frames are heavily smoothed so the overlay does not jitter;
     // a real movement snaps instead of lagging behind the page.
-    const alpha = !prev || move > 0.05 ? 1 : move > 0.02 ? 0.62 : 0.28;
+    // Light smoothing only while the quad is almost still. A real move, including a
+    // switch to another object, snaps on this frame so the fill never lags the camera.
+    // Tiny shake is smoothed so the fill does not jitter. A real pan still snaps.
+    const alpha = !prev || move > 0.028 ? 1 : move > 0.01 ? 0.7 : 0.4;
     const mix = (a: { x: number; y: number }, b: { x: number; y: number }) => ({ x: a.x * (1 - alpha) + b.x * alpha, y: a.y * (1 - alpha) + b.y * alpha });
     const sm = (prev && alpha < 1 ? q.map((p, i) => mix(prev[i], p)) : q) as Quad;
     const pm = lastMids.current;
@@ -241,6 +257,7 @@ export default function CameraScreen({ docId }: { docId?: string }) {
       pc.width = Math.round(c.width * pk); pc.height = Math.round(c.height * pk);
       pc.getContext('2d')!.drawImage(c, 0, 0, pc.width, pc.height);
       const preview = pc.toDataURL('image/jpeg', 0.7);
+      setFly({ id: Date.now(), src: preview });
       c.width = c.height = 0;
       const corners = det?.found ? det.corners : undefined;
       const mids = det?.found && s.dewarp && det.curved ? det.mids : null;
@@ -330,7 +347,6 @@ export default function CameraScreen({ docId }: { docId?: string }) {
   const found = !!det?.found;
   const stable = found && stableP > 0.35;
   const q = det?.corners?.map(map);
-  const qm = det?.mids?.map(map);
   const readyCount = tray.filter((t) => t.status === 'ready').length;
   const pageCount = tray.reduce((n, t) => n + (t.book ? 2 : 1), 0);
 
@@ -362,29 +378,36 @@ export default function CameraScreen({ docId }: { docId?: string }) {
           <svg className="absolute inset-0 w-full h-full pointer-events-none" data-testid="cam-overlay">
             {!found && <FrameGuides w={dims.cw} h={dims.ch} />}
             {q && (
-              <g className="transition-all">
-                <path d={overlayPath(q, qm)} fill="rgba(142,224,74,0.14)" stroke="#8ee04a" strokeWidth="2.5" strokeLinejoin="round" data-testid="cam-quad" />
-                {s.captureMode === 'book' && <line data-testid="cam-spine" x1={(q[0].x + q[1].x) / 2} y1={(q[0].y + q[1].y) / 2} x2={(q[3].x + q[2].x) / 2} y2={(q[3].y + q[2].y) / 2} stroke="#8ee04a" strokeWidth="2" strokeDasharray="8 7" />}
-                {q.map((p, i) => {
-                  const a = q[(i + 1) % 4], b = q[(i + 3) % 4];
-                  const L = 26;
-                  const ua = norm(a.x - p.x, a.y - p.y), ub = norm(b.x - p.x, b.y - p.y);
-                  return <path key={i} d={`M${p.x + ua.x * L},${p.y + ua.y * L} L${p.x},${p.y} L${p.x + ub.x * L},${p.y + ub.y * L}`} stroke="#8ee04a" strokeWidth="6" fill="none" strokeLinecap="round" strokeLinejoin="round" />;
-                })}
+              <g>
+                <path d={overlayPath(q, null)} fill="rgba(32,196,168,0.46)" stroke="none" data-testid="cam-quad" />
+                {s.captureMode === 'book' && <line data-testid="cam-spine" x1={(q[0].x + q[1].x) / 2} y1={(q[0].y + q[1].y) / 2} x2={(q[3].x + q[2].x) / 2} y2={(q[3].y + q[2].y) / 2} stroke="#14b8a6" strokeWidth="1.5" strokeDasharray="8 7" />}
               </g>
             )}
           </svg>
         )}
+        {found && s.autoCapture && stableP > 0 && (
+          <div data-testid="cam-lock" className="absolute left-1/2 top-[46%] z-20 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-2 pointer-events-none">
+            <svg className="h-20 w-20 -rotate-90" viewBox="0 0 80 80" aria-hidden>
+              <circle cx="40" cy="40" r="30" stroke="rgba(255,255,255,.45)" strokeWidth="4" fill="none" />
+              <circle cx="40" cy="40" r="30" stroke="#fff" strokeWidth="4" fill="none" strokeLinecap="round" strokeDasharray={188} strokeDashoffset={188 * (1 - stableP)} />
+            </svg>
+            <div className="rounded-full bg-black/60 px-3 py-1 text-sm text-white">กำลังจับภาพอัตโนมัติ</div>
+          </div>
+        )}
         {flash > 0 && <div key={flash} className="absolute inset-0 bg-white animate-flash pointer-events-none" />}
+        {fly && (
+          <img key={fly.id} src={fly.src} alt="" data-testid="cam-fly" onAnimationEnd={() => setFly(null)}
+            className="pointer-events-none fixed z-50 h-32 w-24 rounded-xl object-cover shadow-2xl animate-flythumb" />
+        )}
         {cam === 'live' && (
-          <div className="absolute inset-x-0 bottom-4 flex justify-center pointer-events-none" data-testid="cam-hint">
-            <div className={cx('flex items-center gap-2.5 rounded-2xl px-4 py-2 text-sm backdrop-blur transition-all', found ? 'bg-black/60' : 'bg-black/40')}>
-              {found ? <span className="h-6 w-6 rounded-full bg-lime text-ink-900 flex items-center justify-center"><Check size={15} strokeWidth={3} /></span> : <Spinner size={16} className="text-white/60" />}
+          <div className={cx('absolute inset-x-0 flex justify-center pointer-events-none', found ? 'bottom-4' : 'top-1/2 -translate-y-1/2')} data-testid="cam-hint">
+            <div className={cx('flex items-center gap-2.5 rounded-full px-4 py-2 text-sm', found ? 'bg-black/60 backdrop-blur' : 'bg-black/55')}>
+              {found ? <span className="h-6 w-6 rounded-full bg-lime text-ink-900 flex items-center justify-center"><Check size={15} strokeWidth={3} /></span> : null}
               <span className="leading-tight">
                 {found ? (
                   s.autoCapture ? (stable ? <>ถือนิ่งๆ ไว้<br /><span className="text-white/70 text-xs">กำลังถ่ายอัตโนมัติ…</span></> : <>เอกสารอยู่ในกรอบแล้ว<br /><span className="text-white/70 text-xs">ถือนิ่งเพื่อถ่ายอัตโนมัติ หรือกดถ่ายได้เลย</span></>)
                     : <>เอกสารอยู่ในกรอบแล้ว<br /><span className="text-white/70 text-xs">กดถ่ายภาพได้เลย</span></>
-                ) : <>วางเอกสารให้อยู่ในกรอบ<br /><span className="text-white/70 text-xs">วางบนพื้นสีเข้ม แสงสว่างเพียงพอ</span></>}
+                ) : <span data-testid="cam-search">กำลังค้นหาเอกสาร</span>}
               </span>
             </div>
           </div>

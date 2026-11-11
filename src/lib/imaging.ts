@@ -330,7 +330,7 @@ function chalkBoard(L: Uint8ClampedArray) {
   return f > 0.008 && f < 0.4;
 }
 
-function glareFraction(img: Img) {
+export function glareFraction(img: Img) {
   const d = img.data;
   const step = Math.max(1, Math.floor(d.length / 4 / 8000));
   let n = 0, g = 0;
@@ -354,7 +354,7 @@ function restoreStamps(img: Img, orig: Uint8ClampedArray) {
 }
 
 /** Pull specular blobs down toward the local paper brightness. */
-function suppressGlare(img: Img) {
+export function suppressGlare(img: Img) {
   const { width: w, height: h, data: d } = img;
   const L = luminance(img);
   const bg = background(L, w, h, 36);
@@ -366,6 +366,37 @@ function suppressGlare(img: Img) {
     d[j + 1] = d[j + 1] * (1 - k) + t * k;
     d[j + 2] = d[j + 2] * (1 - k) + t * k;
   }
+}
+
+/**
+ * A product box, label or photo is mostly saturated color. A text page is mostly pale paper.
+ * Paper-whitening would wash the box, so those scans keep their color.
+ */
+function objectNotPaper(img: Img) {
+  const { width: w, height: h, data: d } = img;
+  const x0 = (w * 0.12) | 0, x1 = (w * 0.88) | 0, y0 = (h * 0.12) | 0, y1 = (h * 0.88) | 0;
+  const step = Math.max(1, Math.floor(((x1 - x0) * (y1 - y0)) / 7000));
+  let paper = 0, chroma = 0, n = 0;
+  for (let y = y0; y < y1; y += step) for (let x = x0; x < x1; x += step) {
+    const i = (y * w + x) * 4;
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    const l = r * 0.299 + g * 0.587 + b * 0.114;
+    if (l > 175 && mx - mn < 26) paper++;
+    if (mx - mn > 34 && l > 25 && l < 250) chroma++;
+    n++;
+  }
+  // Only a clearly colored object (a box, a packet) skips paper whitening.
+  // A text page stays on the document path even if a JPEG decoder shifts its chroma a little.
+  return n > 0 && chroma / n > 0.45 && paper / n < 0.2;
+}
+
+function keepObjectColor(img: Img, sharpenOn: boolean, sr: number) {
+  if (glareFraction(img) > 0.012) suppressGlare(img);
+  const L = luminance(img);
+  applyLumaLUT(img, levelsLUT(percentile(L, 0.005), Math.max(200, percentile(L, 0.995)), 1.02));
+  saturate(img, 1.04);
+  if (sharpenOn) sharpen(img, 0.25, sr);
 }
 
 /** Main enhancement pipeline. Mutates img. */
@@ -396,6 +427,7 @@ export function enhance(img: Img, p: Pick<PageParams, 'mode' | 'brightness' | 'c
       break;
     }
     case 'textBoost': {
+      if (objectNotPaper(img)) { keepObjectColor(img, p.sharpen, sr); break; }
       const orig = new Uint8ClampedArray(img.data);
       let L0 = luminance(img);
       // Chalk on a dark board is inverted before the normal clean-up, so a blackboard
@@ -416,6 +448,7 @@ export function enhance(img: Img, p: Pick<PageParams, 'mode' | 'brightness' | 'c
       break;
     }
     case 'cleanPaper': {
+      if (objectNotPaper(img)) { keepObjectColor(img, p.sharpen, sr); break; }
       if (p.shadow) normalizeColor(img, 1);
       else {
         const L = luminance(img);

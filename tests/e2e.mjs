@@ -713,7 +713,7 @@ await check('Install section shows a real action (prompt or platform instruction
 
 // ---------------------------------------------------------------- PIPELINE
 section = 'ระบบประมวลผล (Pipeline accuracy)';
-for (const name of ['skewed_shadow', 'curved', 'rotated']) {
+for (const name of ['skewed_shadow', 'curved', 'rotated', 'square_sign', 'box_face', 'color_label', 'clear_board', 'noodle_packet']) {
   await check(`Four-corner detection on “${name}.jpg” matches ground truth`, async () => {
     const truth = JSON.parse(readFileSync(`test-assets/${name}.json`, 'utf8')).corners;
     const n0 = await docCount();
@@ -722,9 +722,10 @@ for (const name of ['skewed_shadow', 'curved', 'rotated']) {
     const d = (await dbDocs(p)).sort((a, b) => b.createdAt - a.createdAt)[0];
     const c = d.pages[0].corners;
     const err = Math.max(...c.map((q, i) => Math.hypot(q.x - truth[i].x, q.y - truth[i].y)));
-    if (name !== 'curved') assert(err < 0.03, 'corner error ' + err.toFixed(3));
+    const limit = ['square_sign', 'box_face', 'color_label', 'clear_board', 'noodle_packet'].includes(name) ? 0.06 : 0.03;
+    if (name !== 'curved') assert(err < limit, 'corner error ' + err.toFixed(3));
     if (name === 'curved') assert(d.pages[0].mids, 'curvature not detected');
-    else assert(!d.pages[0].mids, 'false curvature');
+    if (name === 'skewed_shadow' || name === 'rotated') assert(!d.pages[0].mids, 'false curvature');
     return `max corner error ${(err * 100).toFixed(2)}% · curved=${!!d.pages[0].mids}`;
   });
 }

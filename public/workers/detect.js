@@ -124,7 +124,40 @@ function edgeMids(q, pts) {
   return mids;
 }
 
-function detect(imgData) {
+/** How much of each side sits on a real edge. Color does not matter, only the boundary. */
+function edgeSupport(q, edge) {
+  const w = edge.cols, h = edge.rows, data = edge.data;
+  let sum = 0, worst = 1;
+  for (let s = 0; s < 4; s++) {
+    const A = q[s], B = q[(s + 1) % 4];
+    const dx = B.x - A.x, dy = B.y - A.y;
+    const L = Math.hypot(dx, dy) || 1;
+    const nx = -dy / L, ny = dx / L;
+    let hits = 0, n = 0;
+    for (let t = 0.08; t <= 0.92; t += 0.07) {
+      const x = A.x + dx * t, y = A.y + dy * t;
+      let hit = 0;
+      for (let o = -5; o <= 5; o++) {
+        const xx = (x + nx * o) | 0, yy = (y + ny * o) | 0;
+        if (xx >= 0 && yy >= 0 && xx < w && yy < h && data[yy * w + xx]) { hit = 1; break; }
+      }
+      hits += hit;
+      n++;
+    }
+    const f = hits / n;
+    sum += f;
+    if (f < worst) worst = f;
+  }
+  return { mean: sum / 4, min: worst };
+}
+
+function quadGapNorm(a, b, W, H) {
+  let m = 0;
+  for (let i = 0; i < 4; i++) m = Math.max(m, Math.hypot((a[i].x - b[i].x) / W, (a[i].y - b[i].y) / H));
+  return m;
+}
+
+function detect(imgData, hint, fast) {
   const W = imgData.width, H = imgData.height, area = W * H;
   const src = cv.matFromImageData(imgData);
   const gray = new cv.Mat();
@@ -143,6 +176,7 @@ function detect(imgData) {
   const blur = new cv.Mat();
   const k5 = new cv.Size(5, 5);
   const candidates = [];
+  const edgeMap = cv.Mat.zeros(H, W, cv.CV_8UC1);
   const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
   const kernelBig = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(9, 9));
   const kernelText = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(15, 15));
@@ -162,7 +196,7 @@ function detect(imgData) {
     for (let i = 0; i < contours.size(); i++) {
       const cnt = contours.get(i);
       const a = cv.contourArea(cnt);
-      if (a < area * 0.12) { cnt.delete(); continue; }
+      if (a < area * 0.07) { cnt.delete(); continue; }
       const hull = new cv.Mat();
       cv.convexHull(cnt, hull, false, true);
       const peri = cv.arcLength(hull, true);
@@ -182,17 +216,12 @@ function detect(imgData) {
         const aspect = Math.max(topE + botE, leftE + rightE) / Math.min(topE + botE, leftE + rightE);
         // Long thermal slips are skinny but still a real page. A bright interior
         // stripe (aspect ~6, small area) is not, and stays rejected.
+        // Squares are aspect ≈ 1 and are valid. Only absurdly thin strips are dropped,
+        // except a tall receipt that still covers a real share of the frame.
         const longSlip = aspect >= 2.5 && aspect <= 6.2 && qa > area * 0.3;
-        if (isConvex(q) && minAngleOk(q) && qa < area * 0.985 && (aspect < 2.5 || longSlip)) {
-          // fill ratio: how well the contour fills the quad (rejects random shapes)
+        if (isConvex(q) && minAngleOk(q) && qa > area * 0.08 && qa < area * 0.985 && (aspect < 3.2 || longSlip)) {
           const fill = a / qa;
-          if (fill > 0.82) {
-            // Canny follows the real boundary. Bright/normalized masks are the fallback
-            // for low-contrast paper and should not outrank a tight edge contour.
-            let score = qa * (0.6 + 0.4 * fill);
-            if (String(tag).startsWith('canny')) score *= 1.22;
-            candidates.push({ q, score, tag, pts: contourPts(cnt) });
-          }
+          if (fill > 0.78) candidates.push({ q, qa, fill, tag, pts: contourPts(cnt) });
         }
       }
       hull.delete(); cnt.delete();
@@ -203,20 +232,43 @@ function detect(imgData) {
   // 1) Canny edges on gray
   cv.GaussianBlur(gray, blur, k5, 0);
   const edges = new cv.Mat();
-  for (const [lo, hi] of [[40, 120], [15, 60]]) {
+  for (const [lo, hi] of [[40, 120], [15, 60], [30, 90]]) {
     cv.Canny(blur, edges, lo, hi);
     cv.dilate(edges, edges, kernel, new cv.Point(-1, -1), 2);
     cv.erode(edges, edges, kernel, new cv.Point(-1, -1), 1);
+    cv.bitwise_or(edgeMap, edges, edgeMap);
     consider(edges, 'canny' + lo);
   }
-  // 2) Otsu on paperness
+  // Strong contrast boundaries, whatever color is inside. A green tin, a red label
+  // and a photo print all show up here. Brightness is not consulted.
+  const grad = new cv.Mat();
+  cv.morphologyEx(blur, grad, cv.MORPH_GRADIENT, kernel);
+  cv.threshold(grad, grad, 16, 255, cv.THRESH_BINARY);
+  cv.dilate(grad, grad, kernel, new cv.Point(-1, -1), 1);
+  cv.bitwise_or(edgeMap, grad, edgeMap);
+  consider(grad, 'grad');
+  grad.delete();
+  // Cap specular highlights, then look for edges again. A clear cutting board and a
+  // shiny packet stay one rectangle instead of breaking up around the glare.
+  const dull = new cv.Mat();
+  cv.threshold(blur, dull, 232, 232, cv.THRESH_TRUNC);
+  cv.Canny(dull, edges, 18, 60);
+  cv.dilate(edges, edges, kernel, new cv.Point(-1, -1), 2);
+  cv.bitwise_or(edgeMap, edges, edgeMap);
+  consider(edges, 'cannyGloss');
+  dull.delete();
+  // Paper masks are only a fallback for a white sheet on a white table. On the live
+  // path a strong edge quad already wins, so these are skipped to stay at frame rate.
+  const strongEdge = candidates.some((c) => (c.tag === 'grad' || String(c.tag).startsWith('canny')) && c.qa > area * 0.12);
   const pb = new cv.Mat();
-  cv.GaussianBlur(paperness, pb, new cv.Size(7, 7), 0);
   const th = new cv.Mat();
-  cv.threshold(pb, th, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-  cv.morphologyEx(th, th, cv.MORPH_CLOSE, kernelBig);
-  cv.morphologyEx(th, th, cv.MORPH_OPEN, kernelBig);
-  consider(th, 'otsu', true);
+  if (!fast || !strongEdge) {
+    cv.GaussianBlur(paperness, pb, new cv.Size(7, 7), 0);
+    cv.threshold(pb, th, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    cv.morphologyEx(th, th, cv.MORPH_CLOSE, kernelBig);
+    cv.morphologyEx(th, th, cv.MORPH_OPEN, kernelBig);
+    consider(th, 'otsu', true);
+  }
   // 3) Otsu on gray
   const th2 = new cv.Mat();
   cv.threshold(blur, th2, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
@@ -229,22 +281,24 @@ function detect(imgData) {
     cv.bitwise_not(blur, inv);
     cv.Canny(inv, de, 25, 80);
     cv.dilate(de, de, kernel, new cv.Point(-1, -1), 2);
+    cv.bitwise_or(edgeMap, de, edgeMap);
     consider(de, 'dark');
     inv.delete();
     de.delete();
   }
   // Bright-paper masks. A white sheet on a white table has almost no Canny edge, but it is
   // still a few levels brighter than the table. Several cutoffs, text holes closed.
+  // They never outrank a boundary that actually has edges.
   const hi = new cv.Mat();
-  for (const cut of [205, 225, 240, 248]) {
-    cv.threshold(blur, hi, cut, 255, cv.THRESH_BINARY);
-    cv.morphologyEx(hi, hi, cv.MORPH_CLOSE, kernelText);
-    cv.morphologyEx(hi, hi, cv.MORPH_OPEN, kernel);
-    consider(hi, 'bright' + cut, true);
+  if (!fast || !strongEdge) {
+    for (const cut of [205, 225, 240, 248]) {
+      cv.threshold(blur, hi, cut, 255, cv.THRESH_BINARY);
+      cv.morphologyEx(hi, hi, cv.MORPH_CLOSE, kernelText);
+      cv.morphologyEx(hi, hi, cv.MORPH_OPEN, kernel);
+      consider(hi, 'bright' + cut, true);
+    }
   }
-  // Illumination-normalized edges only when the fast masks missed the page (white on white,
-  // heavy shadow). Skipping it on an easy frame keeps the live preview responsive.
-  const havePage = candidates.some((c) => c.score > area * 0.22);
+  const havePage = candidates.some((c) => c.qa > area * 0.18);
   const wide = new cv.Mat();
   const illum = new cv.Mat();
   const nedges = new cv.Mat();
@@ -254,16 +308,43 @@ function detect(imgData) {
     cv.GaussianBlur(illum, blur, k5, 0);
     cv.Canny(blur, nedges, 20, 60);
     cv.dilate(nedges, nedges, kernel, new cv.Point(-1, -1), 2);
+    cv.bitwise_or(edgeMap, nedges, edgeMap);
     consider(nedges, 'norm');
   }
 
-  [src, gray, hsv, rgb, sat, val, paperness, blur, edges, pb, th, th2, kernel, kernelBig, kernelText, hand, noHand, hi, wide, illum, nedges].forEach((m) => m.delete());
+  for (const c of candidates) {
+    const sup = edgeMap.data && edgeMap.rows ? edgeSupport(c.q, edgeMap) : { mean: 0.5, min: 0.5 };
+    const cx = c.q.reduce((s, p) => s + p.x, 0) / 4, cy = c.q.reduce((s, p) => s + p.y, 0) / 4;
+    const centrality = 1 - Math.min(1, Math.hypot(cx - W / 2, cy - H / 2) / (0.5 * Math.hypot(W, H)));
+    // Prominence: large, central, and sitting on real edges. A white blob with no
+    // boundary loses to a smaller colored rectangle that has four strong sides.
+    let score = c.qa * (0.28 + 0.72 * sup.mean) * (0.7 + 0.3 * centrality) * (0.55 + 0.45 * c.fill);
+    // The photograph's own border is not an object. A real page still has margin.
+    let onBorder = 0;
+    for (const p of c.q) if (p.x < W * 0.025 || p.y < H * 0.025 || p.x > W * 0.975 || p.y > H * 0.975) onBorder++;
+    if (onBorder >= 3) score *= 0.08;
+    if (String(c.tag).startsWith('canny') || c.tag === 'grad') score *= 1.2;
+    if ((String(c.tag).startsWith('bright') || String(c.tag).startsWith('otsu') || c.tag === 'norm') && sup.mean < 0.38) score *= 0.4;
+    c.score = score;
+    c.sup = sup.mean;
+  }
+  [src, gray, hsv, rgb, sat, val, paperness, blur, edges, pb, th, th2, kernel, kernelBig, kernelText, hand, noHand, hi, wide, illum, nedges, edgeMap].forEach((m) => m.delete());
   chans.delete();
 
   if (!candidates.length) return { found: false };
-  // prefer largest; when two methods agree, boost
   candidates.sort((a, b) => b.score - a.score);
-  const best = candidates[0];
+  let best = candidates[0];
+  // Stick to the quad we are already tracking when it is still a strong candidate,
+  // so two similar outlines do not flicker. A clearly better shape elsewhere wins
+  // on this same frame (a pan switches in one step, with no lag).
+  if (hint && hint.length === 4) {
+    const hq = hint.map((p) => ({ x: p.x * W, y: p.y * H }));
+    const near = candidates.filter((c) => c.score > best.score * 0.72 && quadGapNorm(c.q, hq, W, H) < 0.07);
+    if (near.length) {
+      near.sort((a, b) => quadGapNorm(a.q, hq, W, H) - quadGapNorm(b.q, hq, W, H));
+      best = near[0];
+    }
+  }
   const mids = edgeMids(best.q, best.pts);
   // pull corners slightly inward so background never bleeds into the scan edge
   const cx = best.q.reduce((s, p) => s + p.x, 0) / 4, cy = best.q.reduce((s, p) => s + p.y, 0) / 4;
@@ -292,7 +373,7 @@ self.onmessage = async (e) => {
     if (type === 'detect') {
       await loadCV();
       const t0 = performance.now();
-      const r = detect(e.data.image);
+      const r = detect(e.data.image, e.data.hint || null, !!e.data.fast);
       r.ms = Math.round(performance.now() - t0);
       self.postMessage({ id, ok: true, result: r });
     }
