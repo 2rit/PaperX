@@ -1,6 +1,7 @@
 // Main-thread clients for the processing & detection workers.
 import type { PageParams, Pt, Quad } from './types';
 import ProcessWorker from '../workers/process.worker.ts?worker';
+import { emitModelProgress, onModelProgress, type ModelProgress } from './learned';
 
 type Pending = { res: (v: any) => void; rej: (e: any) => void };
 
@@ -12,6 +13,7 @@ function makeClient(factory: () => Worker) {
     if (!w) {
       w = factory();
       w.onmessage = (e) => {
+        if (e.data?.type === 'models') { emitModelProgress(e.data as ModelProgress); return; }
         const p = pending.get(e.data.id);
         if (!p) return;
         pending.delete(e.data.id);
@@ -92,13 +94,54 @@ export function warmupDetector() {
     () => (cvState = 'ready'),
     () => (cvState = 'failed'),
   );
+  // Download DocAligner in the processing worker, not on the UI thread.
+  proc.call({ type: 'warmupModels', which: 'detect' }).catch(() => {});
 }
 export const detectorState = () => cvState;
-export async function detectDocument(image: ImageData): Promise<Detection> {
+export { onModelProgress };
+
+function cornerGap(a: Quad, b: Quad) {
+  let m = 0;
+  for (let i = 0; i < 4; i++) m = Math.max(m, Math.hypot(a[i].x - b[i].x, a[i].y - b[i].y));
+  return m;
+}
+
+function mergeDetection(classical: Detection, learned: { corners: Quad; areaRatio: number } | null): Detection {
+  if (!learned) return classical;
+  if (!classical.found || !classical.corners) {
+    return { found: true, corners: learned.corners, areaRatio: learned.areaRatio, curved: false };
+  }
+  const gap = cornerGap(classical.corners, learned.corners);
+  // They agree. Keep the classical quad, including its curved-edge handles.
+  if (gap <= 0.045) return classical;
+  // Classical grabbed the whole frame or a thin strip. Trust the learned quad.
+  const ca = classical.areaRatio ?? 0;
+  const weak = ca > 0.92 || ca < 0.18;
+  if (weak && learned.areaRatio > 0.12 && learned.areaRatio < 0.95) {
+    return { found: true, corners: learned.corners, areaRatio: learned.areaRatio, mids: gap < 0.1 ? classical.mids : undefined, curved: gap < 0.1 && !!classical.curved };
+  }
+  return classical;
+}
+
+export async function detectDocument(image: ImageData, opts?: { waitModel?: boolean }): Promise<Detection> {
+  const pixels = new Uint8ClampedArray(image.data);
+  const view = { data: pixels, width: image.width, height: image.height };
   try {
-    const r = await detector.call<Detection>({ type: 'detect', image }, [image.data.buffer]);
+    const classicalP = detector.call<Detection>({ type: 'detect', image }, [image.data.buffer]);
+    // Live frames stay classical so the viewfinder is not blocked. A still asks the
+    // worker for DocAligner and does not wait long enough to freeze the page.
+    let learnedP: Promise<{ corners: Quad; areaRatio: number } | null> = Promise.resolve(null);
+    if (opts?.waitModel) {
+      const copy = new Uint8ClampedArray(pixels);
+      learnedP = Promise.race([
+        proc.call<{ corners: Quad; areaRatio: number } | null>({ type: 'align', width: view.width, height: view.height, data: copy }, [copy.buffer]),
+        new Promise<null>((res) => setTimeout(() => res(null), 2500)),
+      ]).catch(() => null);
+    }
+    const classical = await classicalP;
     cvState = 'ready';
-    return r;
+    const learned = await learnedP;
+    return mergeDetection(classical, learned);
   } catch (e) {
     console.warn('detect failed', e);
     return { found: false };

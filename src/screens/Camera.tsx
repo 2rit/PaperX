@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { BookOpen, Camera as CamIcon, Check, FileText, Image as ImageIcon, RefreshCw, X, Zap, ZapOff } from 'lucide-react';
 import { detectDocument, paperLabel, warmupDetector, detectorState, type Detection } from '../lib/engine';
+import ModelProgress from '../components/ModelProgress';
 import { importFiles, pageFromBlob, renderPage, splitBook } from '../lib/pages';
 import { createDocFromPages, pickFiles } from '../lib/actions';
 import { getDoc, pendingKeys, saveDoc } from '../lib/docs';
@@ -34,7 +35,11 @@ export default function CameraScreen({ docId }: { docId?: string }) {
   const [cvReady, setCvReady] = useState(detectorState() === 'ready');
   const [dims, setDims] = useState({ vw: 0, vh: 0, cw: 0, ch: 0 });
   const trayRef = useRef<TrayItem[]>([]);
-  trayRef.current = tray;
+  const commitTray = (updater: (t: TrayItem[]) => TrayItem[]) => {
+    const next = updater(trayRef.current);
+    trayRef.current = next;
+    setTray(next);
+  };
   const procQueue = useRef<Promise<void>>(Promise.resolve());
   const lastQuad = useRef<Quad | null>(null);
   const lastMids = useRef<Quad | null>(null);
@@ -201,17 +206,19 @@ export default function CameraScreen({ docId }: { docId?: string }) {
   // ---------- capture ----------
   const enqueue = (item: TrayItem, work: () => Promise<Page>) => {
     const book = bookRef.current; // mode at shutter time
-    setTray((t) => [...t, { ...item, book }]);
+    commitTray((t) => [...t, { ...item, book }]);
     procQueue.current = procQueue.current.then(async () => {
       try {
         const base = await work();
         const parts = book ? await splitBook(base) : [base];
         const pages: Page[] = [];
         for (const p of parts) pages.push(await renderPage(p));
-        setTray((t) => t.map((x) => (x.id === item.id ? { ...x, status: 'ready', page: pages[0], pages } : x)));
+        // Write the ref before React paints, so เสร็จสิ้น sees a page that finished
+        // in this same turn (the neural dewarper can outlive the click).
+        commitTray((t) => t.map((x) => (x.id === item.id ? { ...x, status: 'ready' as const, page: pages[0], pages } : x)));
       } catch (e) {
         console.error(e);
-        setTray((t) => t.map((x) => (x.id === item.id ? { ...x, status: 'error' } : x)));
+        commitTray((t) => t.map((x) => (x.id === item.id ? { ...x, status: 'error' as const } : x)));
         toast('ประมวลผลภาพไม่สำเร็จ', { kind: 'error' });
       }
     });
@@ -277,7 +284,7 @@ export default function CameraScreen({ docId }: { docId?: string }) {
 
   const removeItem = (id: string) => {
     haptic('tap');
-    setTray((t) => t.filter((x) => x.id !== id));
+    commitTray((t) => t.filter((x) => x.id !== id));
   };
 
   const finish = async () => {
@@ -345,6 +352,7 @@ export default function CameraScreen({ docId }: { docId?: string }) {
         <div className="h-16 w-24 flex items-center justify-end">
           <button data-testid="cam-close" aria-label="ปิดกล้อง" onClick={close} className="pressable h-12 w-12 rounded-full bg-white/10 flex items-center justify-center"><X size={24} /></button>
         </div>
+        <ModelProgress className="absolute left-1/2 top-14 z-20 w-44 -translate-x-1/2" />
       </div>
 
       {/* viewfinder */}
@@ -464,7 +472,7 @@ export default function CameraScreen({ docId }: { docId?: string }) {
       <Sheet open={confirmClose} onClose={() => setConfirmClose(false)} title={`มี ${pageCount} หน้าที่ถ่ายไว้`} testId="cam-confirm">
         <p className="text-ink/65 mb-5">ต้องการบันทึกเป็นเอกสาร หรือทิ้งหน้าที่ถ่ายไว้?</p>
         <div className="flex gap-3 justify-end">
-          <Button variant="danger" data-testid="cam-discard" onClick={() => { setConfirmClose(false); setTray([]); stop(); back('home'); }}>ทิ้ง</Button>
+          <Button variant="danger" data-testid="cam-discard" onClick={() => { setConfirmClose(false); commitTray(() => []); stop(); back('home'); }}>ทิ้ง</Button>
           <Button variant="lime" onClick={() => { setConfirmClose(false); finish(); }}>บันทึกเอกสาร</Button>
         </div>
       </Sheet>

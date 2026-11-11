@@ -1,6 +1,7 @@
 /// <reference lib="webworker" />
 import { enhance, warp, quadSize, detectSkew, type Img } from '../lib/imaging';
-import { estimateFlow, applyFlow, findSpine, cropHalf, removeFingers, type FlowField } from '../lib/flatten';
+import { estimateFlow, applyFlow, applyUvGrid, findSpine, cropHalf, removeFingers, lineSpread, type FlowField } from '../lib/flatten';
+import { dewarpGeneration, learnedCorners, learnedGrid, warmupModels } from '../lib/learned';
 import type { PageParams, Pt } from '../lib/types';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -12,6 +13,7 @@ interface Source { blob: Blob; w: number; h: number; levels: Map<number, Img> }
 const sources = new Map<string, Source>();
 const warpCache = new Map<string, Img>();
 const flowCache = new Map<string, FlowField | null>();
+const flatCache = new Map<string, Img>();
 
 function canvas(w: number, h: number) {
   const c = new OffscreenCanvas(w, h);
@@ -102,15 +104,53 @@ async function geometry(key: string, p: PageParams, target: Target): Promise<Img
   if (p.book) img = cropHalf(img, p.book.side, p.book.at);
   if (p.flatten) {
     img = removeFingers(img);
-    // the field is estimated on a ~720px copy, so it is resolution independent: cache it per geometry
-    const fk = `${key}|${JSON.stringify(p.corners)}|${JSON.stringify(p.mids)}|${JSON.stringify(p.book || null)}`;
-    let f = flowCache.get(fk);
-    if (f === undefined) {
-      f = estimateFlow(img);
-      flowCache.set(fk, f);
-      if (flowCache.size > 24) flowCache.delete(flowCache.keys().next().value!);
+    // A nearly flat page does not need the learned grid. Loading it there also
+    // pulls dark borders back in and undoes shadow removal.
+    const curl = lineSpread(img);
+    if (curl >= 2 && dewarpGeneration() === 0 && target === 'full') {
+      await Promise.race([warmupModels('dewarp'), new Promise((r) => setTimeout(r, 12000))]);
+    } else if (curl >= 2 && dewarpGeneration() === 0) {
+      warmupModels('dewarp');
     }
-    if (f) img = applyFlow(img, f);
+    const gen = dewarpGeneration();
+    // Target is part of the key: a preview-sized cache must not be reused for the full export.
+    const fk = `${target}|${key}|${JSON.stringify(p.corners)}|${JSON.stringify(p.mids)}|${JSON.stringify(p.book || null)}|g${gen}`;
+    const hit = flatCache.get(fk);
+    if (hit) return cloneImg(hit);
+    const geo = estimateFlow(img);
+    let best = geo ? applyFlow(img, geo) : img;
+    if (gen === 1 && curl >= 2) {
+      try {
+        const grid = await learnedGrid(img);
+        if (grid) {
+          const un = applyUvGrid(img, grid);
+          const extra = estimateFlow(un);
+          const refined = extra ? applyFlow(un, extra) : un;
+          const edge = (im: Img) => {
+            const band = Math.max(2, Math.round(Math.min(im.width, im.height) * 0.08));
+            let s = 0, n = 0;
+            for (let y = 0; y < im.height; y += 4) {
+              for (let x = 0; x < band; x += 3) {
+                const i = (y * im.width + x) * 4;
+                s += im.data[i] * 0.299 + im.data[i + 1] * 0.587 + im.data[i + 2] * 0.114;
+                n++;
+              }
+            }
+            return s / Math.max(1, n);
+          };
+          // Keep the learned grid only when the lines are straighter and the page edge stays as bright.
+          if (lineSpread(refined) < lineSpread(best) * 0.9 && edge(refined) > edge(best) - 12) best = refined;
+        }
+      } catch { /* geometric result stands */ }
+    }
+    flowCache.set(fk, geo);
+    img = best;
+    // While the model is still downloading, don't cache: the next render should try again.
+    if (gen !== 0 && (target === 'preview' || target === 'thumb' || target === 'modeThumb')) {
+      flatCache.set(fk, img);
+      if (flatCache.size > 6) flatCache.delete(flatCache.keys().next().value!);
+      img = cloneImg(img);
+    }
   }
   return img;
 }
@@ -144,7 +184,8 @@ self.onmessage = async (e: MessageEvent) => {
     } else if (type === 'unload') {
       sources.delete(e.data.key);
       for (const k of [...warpCache.keys()]) if (k.startsWith(e.data.key + '|')) warpCache.delete(k);
-      for (const k of [...flowCache.keys()]) if (k.startsWith(e.data.key + '|')) flowCache.delete(k);
+      for (const k of [...flowCache.keys()]) if (k.includes('|' + e.data.key + '|')) flowCache.delete(k);
+      for (const k of [...flatCache.keys()]) if (k.includes('|' + e.data.key + '|')) flatCache.delete(k);
       result = true;
     } else if (type === 'render') {
       result = await render(e.data.key, e.data.params, e.data.target, e.data.opts || {});
@@ -157,8 +198,16 @@ self.onmessage = async (e: MessageEvent) => {
     } else if (type === 'flowInfo') {
       await geometry(e.data.key, { ...e.data.params, flatten: true }, 'preview');
       const p = e.data.params;
-      const f = flowCache.get(`${e.data.key}|${JSON.stringify(p.corners)}|${JSON.stringify(p.mids)}|${JSON.stringify(p.book || null)}`);
+      const prefix = `|${e.data.key}|${JSON.stringify(p.corners)}|${JSON.stringify(p.mids)}|${JSON.stringify(p.book || null)}|`;
+      const f = [...flowCache.entries()].find(([k]) => k.startsWith(prefix))?.[1];
       result = { strength: f ? f.strength : 0 };
+    } else if (type === 'warmupModels') {
+      await Promise.race([warmupModels(e.data.which || 'both'), new Promise((r) => setTimeout(r, 20000))]);
+      result = true;
+    } else if (type === 'align') {
+      await Promise.race([warmupModels('detect'), new Promise((r) => setTimeout(r, 1800))]);
+      const data = new Uint8ClampedArray(e.data.data);
+      result = await learnedCorners({ data, width: e.data.width, height: e.data.height });
     } else if (type === 'downscale') {
       // decode a picked file, honour EXIF orientation, and downscale to protect memory (iOS)
       const { blob, max, quality } = e.data;

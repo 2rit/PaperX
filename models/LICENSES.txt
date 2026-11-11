@@ -1,0 +1,28 @@
+PaperX ships two pretrained models. Both run on-device. Training images are not included.
+The weight tensors are stored as float16 to cut the download in half. The graph casts them
+back to float32 before the convolutions, so the results stay within about 0.002 of the
+original float32 exports. They are not downloaded at startup: the first scan fetches them,
+shows a progress bar, and keeps the bytes in IndexedDB (the service worker also caches the
+response). WebGPU is tried first, then single-thread WASM. If that fails, the classical
+detector and geometric dewarper are used unchanged.
+
+DocAligner LCNet-100 (docaligner-lcnet100.onnx)
+  Task: four document corners, heatmap regression, trained on real document photos
+  Source: DocsaidLab/DocAligner (Apache License 2.0)
+  Mirror used for the unmodified ONNX file: huggingface.co/kittypdf/DocAligner-ONNX
+  Input: float32 NCHW 1x3x256x256, RGB pixels divided by 255
+  Output: float32 1x4x128x128 corner heatmaps in order TL, TR, BR, BL
+
+UVDoc grid (UVDoc_grid.onnx)
+  Task: document unwarping grid, weights trained for the UVDoc paper (Doc3D / real captured pages)
+  Original project: tanguymagne/UVDoc (MIT License)
+  This file is the public ONNX export that returns a 45x31 coordinate grid
+  (huggingface.co/fredcallagan/uvdoc-grid-onnx). The export is published as Apache-2.0;
+  the underlying weights follow the original MIT license.
+  Input: float32 NCHW 1x3x720x496, RGB in 0..1
+  Output: float32 1x2x45x31 grid, x then y, in -1..1
+
+ONNX Runtime Web (Apache License 2.0) executes the models.
+Providers are tried in order: WebGPU, WebGL, then WASM (single thread, so GitHub Pages
+works without cross-origin isolation). If a model fails to load or is slower than the
+classical detector / geometric dewarper, PaperX keeps the classical result.

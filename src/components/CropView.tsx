@@ -101,7 +101,7 @@ export default function CropView({ srcKey, corners, mids, onCancel, onApply }: {
     try {
       const b = await getBlob(srcKey);
       const { small } = await downscale(b!, 640);
-      const d = await detectDocument(small);
+      const d = await detectDocument(small, { waitModel: true });
       if (d.found && d.corners) {
         setQ(d.corners);
         setM(d.curved && d.mids ? d.mids : null);

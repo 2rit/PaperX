@@ -27,7 +27,7 @@ export async function pageFromBlob(
     corners = opts.corners;
     mids = opts.mids ?? null;
   } else if (!opts.flat && s.autoCrop) {
-    const d = await detectDocument(small);
+    const d = await detectDocument(small, { waitModel: true });
     if (d.found && d.corners && (d.areaRatio ?? 0) > 0.12) {
       corners = d.corners;
       mids = s.dewarp && d.curved && d.mids ? d.mids : null;

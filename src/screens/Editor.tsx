@@ -5,6 +5,8 @@ import {
 } from 'lucide-react';
 import { getBlob, getDoc, saveDoc, useDocs, duplicateDoc, deleteDocs, restoreDocs, pendingKeys } from '../lib/docs';
 import { ensureSource, renderBitmap, detectSkew, detectSpine } from '../lib/engine';
+import { onModelProgress } from '../lib/learned';
+import ModelProgress from '../components/ModelProgress';
 import { renderPage, splitBook } from '../lib/pages';
 import { importIntoDoc, pickFiles } from '../lib/actions';
 import { navigate, back } from '../lib/router';
@@ -104,7 +106,9 @@ export default function Editor({ id, startPage = 0 }: { id: string; startPage?: 
 
   // ---------- live preview (worker, latest-only) ----------
   const reqRef = useRef(0);
-  const pageSig = page ? sig(page) + page.srcKey : '';
+  const [modelTick, setModelTick] = useState(0);
+  useEffect(() => onModelProgress((p) => { if (p.phase === 'ready' && p.name === 'dewarp') setModelTick((n) => n + 1); }), []);
+  const pageSig = page ? sig(page) + page.srcKey + ':' + modelTick : '';
   useEffect(() => {
     if (!page) return;
     const my = ++reqRef.current;
@@ -470,6 +474,7 @@ export default function Editor({ id, startPage = 0 }: { id: string; startPage?: 
                 <div className="absolute top-3 right-3 text-xs bg-lime text-ink-900 font-semibold rounded-full px-3 py-1">หลัง</div>
               </>
             )}
+            <ModelProgress className="absolute bottom-3 left-1/2 z-10 w-48 -translate-x-1/2 pointer-events-none" />
             {view === 'edit' && (
               <button data-testid="ed-flatten-chip" aria-pressed={!!page.flatten} onClick={() => { haptic('tap'); update({ flatten: !page.flatten }); toast(page.flatten ? 'ปิด Auto Flatten' : 'เปิด Auto Flatten · คลี่หน้าโค้ง/ยับให้เรียบ', { ms: 1600 }); }}
                 className={cx('pressable absolute top-3 left-3 z-10 h-9 px-3 rounded-full text-xs font-medium flex items-center gap-1.5 backdrop-blur', page.flatten ? 'bg-lime text-ink-900' : 'bg-black/60 text-white/85')}>

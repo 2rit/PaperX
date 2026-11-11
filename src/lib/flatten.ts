@@ -501,6 +501,23 @@ function enforceRules(img: Img, f: FlowField) {
   }
 }
 
+function calmGutter(f: FlowField) {
+  const limit = 0.018;
+  const next = new Float32Array(f.d);
+  for (let i = 0; i < f.gx; i++) {
+    const left = Math.max(0, i - 1), right = Math.min(f.gx - 1, i + 1);
+    for (let j = 0; j < f.gy; j++) {
+      const v = f.d[i * f.gy + j];
+      const l = f.d[left * f.gy + j], r = f.d[right * f.gy + j];
+      const edge = i === 0 || i === f.gx - 1;
+      const neighbour = i === 0 ? r : l;
+      if (edge && Math.abs(v - neighbour) > limit) next[i * f.gy + j] = neighbour;
+      else if (!edge && Math.abs(v - l) > limit && Math.abs(v - r) > limit && (v - l) * (v - r) > 0) next[i * f.gy + j] = (l + r) / 2;
+    }
+  }
+  f.d.set(next);
+}
+
 /** Mean absolute disagreement of strip shifts versus the centre strip, in pixels. */
 export function lineSpread(img: Img) {
   const { g, w, h } = grayOf(img, 420);
@@ -552,6 +569,10 @@ export function estimateFlow(img: Img, iters = 2): FlowField | null {
     if (it < iters - 1) small = applyFlow(shrink(img, 720), total);
   }
   if (!total) return null;
+  // A gutter shadow can lock the outermost strip onto the next text line, which
+  // bends the right-hand page the wrong way. A real sheet cannot jump that far
+  // between two neighbouring strips, so pull the spike back to its neighbour.
+  calmGutter(total);
   enforceRules(small, total);
   let m = 0;
   for (const v of total.d) m = Math.max(m, Math.abs(v));
@@ -573,6 +594,29 @@ function sampleBilinear(data: Uint8ClampedArray, w: number, h: number, x: number
   out[o + 1] = data[i00 + 1] * w00 + data[i10 + 1] * w10 + data[i01 + 1] * w01 + data[i11 + 1] * w11;
   out[o + 2] = data[i00 + 2] * w00 + data[i10 + 2] * w10 + data[i01 + 2] * w01 + data[i11 + 2] * w11;
   out[o + 3] = 255;
+}
+
+/**
+ * Apply a UVDoc sampling grid. `grid` is x then y, each 45×31, in normalized −1..1.
+ * out(x, y) = in(grid). The geometric sheet can still run on the result.
+ */
+export function applyUvGrid(img: Img, grid: Float32Array): Img {
+  const GH = 45, GW = 31;
+  const { width: w, height: h, data } = img;
+  const out = new Uint8ClampedArray(data.length);
+  const at = (yy: number, xx: number, ch: number) => grid[ch * GH * GW + yy * GW + xx];
+  for (let y = 0; y < h; y++) {
+    const gy = h === 1 ? 0 : (y / (h - 1)) * (GH - 1);
+    const y0 = Math.min(GH - 2, gy | 0), ty = gy - y0;
+    for (let x = 0; x < w; x++) {
+      const gx = w === 1 ? 0 : (x / (w - 1)) * (GW - 1);
+      const x0 = Math.min(GW - 2, gx | 0), tx = gx - x0;
+      const sx = at(y0, x0, 0) * (1 - tx) * (1 - ty) + at(y0, x0 + 1, 0) * tx * (1 - ty) + at(y0 + 1, x0, 0) * (1 - tx) * ty + at(y0 + 1, x0 + 1, 0) * tx * ty;
+      const sy = at(y0, x0, 1) * (1 - tx) * (1 - ty) + at(y0, x0 + 1, 1) * tx * (1 - ty) + at(y0 + 1, x0, 1) * (1 - tx) * ty + at(y0 + 1, x0 + 1, 1) * tx * ty;
+      sampleBilinear(data, w, h, ((sx + 1) / 2) * (w - 1), ((sy + 1) / 2) * (h - 1), out, (y * w + x) * 4);
+    }
+  }
+  return { data: out, width: w, height: h };
 }
 
 /** Resample: out(x, y) = in(x + Dx, y + Dy). */
